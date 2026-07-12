@@ -9,6 +9,7 @@
 """
 
 import os
+import json
 import datetime
 import discord
 from discord.ext import commands
@@ -17,11 +18,55 @@ from dotenv import load_dotenv
 # โหลดค่าจากไฟล์ .env (เก็บ Token แยกจากโค้ด เพื่อความปลอดภัย)
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+LEGACY_LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))  # ใช้เป็นค่า fallback สำหรับเซิร์ฟเวอร์เดิมเท่านั้น
 
 UNVERIFIED_ROLE_NAME = "Unverified"
 VERIFIED_ROLE_NAME = "Verified"
 BOT_ADMIN_ROLE_NAME = "Bot Admin"  # role ที่เจ้าของเซิร์ฟใช้แต่งตั้งให้คนอื่นใช้คำสั่ง moderation ได้
+DEVELOPER_CREDIT = os.getenv("DEVELOPER_CREDIT", "ACER")  # ชื่อ/แท็กผู้พัฒนาที่จะโชว์ในคู่มือ ตั้งค่าเองได้ผ่าน .env
+
+# ========== ระบบตั้งค่าแยกตามเซิร์ฟเวอร์ (multi-server support) ==========
+# แต่ละเซิร์ฟเวอร์ตั้งช่อง log ของตัวเองได้ผ่านคำสั่ง !setlog เก็บไว้ในไฟล์นี้
+# CONFIG_DIR: ถ้าตั้งค่า env var นี้ไว้ (เช่น mount Railway Volume ที่ /data) ไฟล์จะไม่หายตอน deploy ใหม่
+# ถ้าไม่ได้ตั้ง จะเก็บไว้ข้างไฟล์ bot.py เหมือนเดิม (จะหายเมื่อ deploy ใหม่บน Railway ถ้าไม่มี Volume)
+CONFIG_DIR = os.getenv("CONFIG_DIR", os.path.dirname(os.path.abspath(__file__)))
+CONFIG_FILE = os.path.join(CONFIG_DIR, "guild_config.json")
+
+
+def load_all_config():
+    """โหลด config ทั้งหมดของทุกเซิร์ฟเวอร์จากไฟล์ JSON"""
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_all_config(data):
+    """เซฟ config ทั้งหมดกลับลงไฟล์ JSON"""
+    os.makedirs(CONFIG_DIR, exist_ok=True)  # เผื่อโฟลเดอร์ (เช่น /data) ยังไม่ถูกสร้าง
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_log_channel_id(guild_id):
+    """คืนค่า channel ID ของช่อง log ที่ตั้งไว้เฉพาะเซิร์ฟเวอร์นี้ (None ถ้ายังไม่ได้ตั้ง)"""
+    data = load_all_config()
+    guild_conf = data.get(str(guild_id))
+    if guild_conf and guild_conf.get("log_channel_id"):
+        return guild_conf["log_channel_id"]
+    return None
+
+
+def set_log_channel_id(guild_id, channel_id):
+    """ตั้งค่าช่อง log ของเซิร์ฟเวอร์นี้ แล้วเซฟลงไฟล์"""
+    data = load_all_config()
+    guild_conf = data.setdefault(str(guild_id), {})
+    guild_conf["log_channel_id"] = channel_id
+    save_all_config(data)
+
 
 # ตั้งค่า Intents (สิทธิ์การเข้าถึงข้อมูลต่างๆ)
 intents = discord.Intents.default()
@@ -33,21 +78,22 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 async def send_log(guild, embed):
-    """ส่ง embed ไปที่ช่อง log ถ้าตั้งค่า LOG_CHANNEL_ID ไว้"""
-    if not LOG_CHANNEL_ID:
-        print("⚠️ [LOG] ไม่ได้ตั้งค่า LOG_CHANNEL_ID ใน .env (ค่าเป็น 0 หรือว่าง)")
+    """ส่ง embed ไปที่ช่อง log ของเซิร์ฟเวอร์นี้ (ตั้งค่าด้วย !setlog) ถ้ายังไม่ได้ตั้ง จะลอง fallback ไปที่ LOG_CHANNEL_ID เดิมใน .env"""
+    log_channel_id = get_log_channel_id(guild.id) or LEGACY_LOG_CHANNEL_ID
+    if not log_channel_id:
+        print(f"⚠️ [LOG] เซิร์ฟเวอร์ '{guild.name}' ยังไม่ได้ตั้งช่อง log — ใช้คำสั่ง !setlog ในช่องที่ต้องการก่อน")
         return
-    channel = guild.get_channel(LOG_CHANNEL_ID)
+    channel = guild.get_channel(log_channel_id)
     if channel is None:
         # เผื่อ cache ยังไม่มีช่องนี้ ลอง fetch จาก API โดยตรง
         try:
-            channel = await guild.fetch_channel(LOG_CHANNEL_ID)
+            channel = await guild.fetch_channel(log_channel_id)
         except discord.NotFound:
-            print(f"❌ [LOG] ไม่พบช่อง ID {LOG_CHANNEL_ID} ในเซิร์ฟเวอร์ '{guild.name}' "
-                  f"(เช็คว่า ID ถูกต้องไหม หรือ copy ID ช่องผิดจากเซิร์ฟเวอร์อื่น)")
+            print(f"❌ [LOG] ไม่พบช่อง ID {log_channel_id} ในเซิร์ฟเวอร์ '{guild.name}' "
+                  f"— ใช้ !setlog ตั้งช่อง log ใหม่")
             return
         except discord.Forbidden:
-            print(f"❌ [LOG] บอทไม่มีสิทธิ์เข้าถึงช่อง ID {LOG_CHANNEL_ID}")
+            print(f"❌ [LOG] บอทไม่มีสิทธิ์เข้าถึงช่อง ID {log_channel_id}")
             return
     try:
         await channel.send(embed=embed)
@@ -111,19 +157,27 @@ async def on_ready():
     print(f"✅ บอทออนไลน์แล้ว: {bot.user}")
     print(f"เชื่อมต่อกับ {len(bot.guilds)} เซิร์ฟเวอร์")
 
-    # เช็ค log channel ทันทีตอนสตาร์ท จะได้รู้ปัญหาไว้ก่อน ไม่ต้องรอ event เกิดขึ้นจริง
-    if not LOG_CHANNEL_ID:
-        print("⚠️ [เช็ค LOG_CHANNEL_ID] ไม่พบค่าใน .env หรือค่าเป็น 0 — log จะไม่ทำงานเลย!")
-    else:
-        found_in_any_guild = False
-        for guild in bot.guilds:
-            channel = guild.get_channel(LOG_CHANNEL_ID)
-            if channel:
-                print(f"✅ [เช็ค LOG_CHANNEL_ID] เจอช่อง log: '#{channel.name}' ในเซิร์ฟเวอร์ '{guild.name}'")
-                found_in_any_guild = True
-        if not found_in_any_guild:
-            print(f"❌ [เช็ค LOG_CHANNEL_ID] ID {LOG_CHANNEL_ID} ไม่ตรงกับช่องใดๆ ในเซิร์ฟเวอร์ที่บอทอยู่ "
-                  f"— เช็คว่า copy ID ช่องมาถูกไหม (คลิกขวาที่ช่อง > Copy Channel ID, ต้องเปิด Developer Mode ก่อน)")
+    # ดึงข้อมูลเจ้าของแอปบอท (คนที่สร้างบอทใน Developer Portal) ไว้ใช้กับคำสั่ง !report
+    try:
+        app_info = await bot.application_info()
+        owner = app_info.team.owner if app_info.team else app_info.owner
+        bot.dev_owner_id = owner.id
+        print(f"✅ เจ้าของบอท (รับรายงานปัญหา): {owner} (ID: {owner.id})")
+    except Exception as e:
+        bot.dev_owner_id = None
+        print(f"⚠️ ดึงข้อมูลเจ้าของบอทไม่ได้: {e} — คำสั่ง !report จะใช้งานไม่ได้")
+
+    # เช็คสถานะช่อง log ของแต่ละเซิร์ฟเวอร์ทันทีตอนสตาร์ท
+    for guild in bot.guilds:
+        log_channel_id = get_log_channel_id(guild.id) or LEGACY_LOG_CHANNEL_ID
+        if not log_channel_id:
+            print(f"⚠️ [{guild.name}] ยังไม่ได้ตั้งช่อง log — ให้แอดมินพิมพ์ !setlog ในช่องที่ต้องการ")
+            continue
+        channel = guild.get_channel(log_channel_id)
+        if channel:
+            print(f"✅ [{guild.name}] ช่อง log: #{channel.name}")
+        else:
+            print(f"❌ [{guild.name}] ตั้งช่อง log ไว้ (ID {log_channel_id}) แต่หาช่องนี้ไม่เจอ — ใช้ !setlog ตั้งใหม่")
 
 
 @bot.event
@@ -507,6 +561,29 @@ async def warn_error(ctx, error):
 
 # ========== ระบบจัดการสิทธิ์แอดมิน ==========
 
+@bot.command(name="setlog")
+@mod_check("manage_guild")
+async def setlog(ctx):
+    """ตั้งค่าช่องที่พิมพ์คำสั่งนี้ให้เป็นช่อง log ของเซิร์ฟเวอร์นี้ พิมพ์ !setlog ในช่องที่ต้องการ"""
+    try:
+        set_log_channel_id(ctx.guild.id, ctx.channel.id)
+    except Exception as e:
+        print(f"❌ [setlog] เซฟ config ไม่สำเร็จ: {e}")
+        await ctx.send(f"❌ ตั้งค่าไม่สำเร็จ เกิดข้อผิดพลาดตอนเซฟไฟล์: `{e}`\n"
+                        f"(เช็คว่า CONFIG_DIR ที่ตั้งไว้ใน Railway Variables ถูกต้อง และ mount path ของ Volume ตรงกันไหม)")
+        return
+    await ctx.send(f"✅ ตั้งค่าช่องนี้ ({ctx.channel.mention}) เป็นช่อง log ของเซิร์ฟเวอร์นี้แล้วครับ")
+
+
+@setlog.error
+async def setlog_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้ (ต้องมีสิทธิ์ Manage Server หรือ role Bot Admin)")
+    else:
+        print(f"❌ [setlog] error ที่ไม่คาดคิด: {error}")
+        await ctx.send(f"❌ เกิดข้อผิดพลาด: `{error}`")
+
+
 @bot.command(name="addadmin")
 async def addadmin(ctx, member: discord.Member):
     """แต่งตั้งให้คนอื่นใช้คำสั่ง moderation ได้ (เฉพาะเจ้าของเซิร์ฟเวอร์) พิมพ์ !addadmin @ชื่อ"""
@@ -615,7 +692,17 @@ def build_help_embed(guild_name=None):
         ),
         inline=False,
     )
-    embed.set_footer(text="คำนำหน้าคำสั่งทั้งหมดคือ ! (เครื่องหมายตกใจ)")
+    embed.add_field(
+        name="⚙️ ตั้งค่าเซิร์ฟเวอร์ (ต้องมีสิทธิ์ Manage Server หรือ role Bot Admin)",
+        value="`!setlog` — ตั้งช่องที่พิมพ์คำสั่งนี้ให้เป็นช่อง log ของเซิร์ฟเวอร์นี้ (**ต้องตั้งก่อน ไม่งั้นระบบ log จะไม่ทำงาน**)",
+        inline=False,
+    )
+    embed.add_field(
+        name="🐛 แจ้งปัญหาบอท (ใครก็ใช้ได้)",
+        value="`!report <รายละเอียดปัญหา>` — ส่งข้อความแจ้งปัญหา/บั๊กไปหาผู้พัฒนาโดยตรง",
+        inline=False,
+    )
+    embed.set_footer(text=f"คำนำหน้าคำสั่งทั้งหมดคือ ! (เครื่องหมายตกใจ)  •  พัฒนาโดย {DEVELOPER_CREDIT}")
     return embed
 
 
@@ -624,6 +711,45 @@ async def help_th(ctx):
     """แสดงคู่มือการใช้งานบอททั้งหมด พิมพ์ !ช่วยด้วย"""
     embed = build_help_embed(guild_name=ctx.guild.name if ctx.guild else None)
     await ctx.send(embed=embed)
+
+
+@bot.command(name="report")
+async def report(ctx, *, message: str = None):
+    """แจ้งปัญหา/บั๊กของบอทไปหาผู้พัฒนาโดยตรง พิมพ์ !report <รายละเอียดปัญหา>"""
+    if not message:
+        await ctx.send("❌ กรุณาพิมพ์รายละเอียดปัญหาด้วยค่ะ เช่น `!report คำสั่ง !mute ใช้ไม่ได้`")
+        return
+
+    dev_owner_id = getattr(bot, "dev_owner_id", None)
+    if not dev_owner_id:
+        await ctx.send("❌ ตอนนี้ส่งรายงานไม่ได้ (บอทหาผู้พัฒนาไม่เจอ) ลองใหม่ภายหลังนะคะ")
+        return
+
+    try:
+        developer = await bot.fetch_user(dev_owner_id)
+    except discord.NotFound:
+        await ctx.send("❌ ตอนนี้ส่งรายงานไม่ได้ ลองใหม่ภายหลังนะคะ")
+        return
+
+    embed = discord.Embed(
+        title="🐛 มีรายงานปัญหาบอทเข้ามาใหม่",
+        description=message,
+        color=discord.Color.red(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="👤 ผู้แจ้ง", value=f"{ctx.author} (ID: {ctx.author.id})", inline=False)
+    embed.add_field(
+        name="🏠 เซิร์ฟเวอร์",
+        value=f"{ctx.guild.name} (ID: {ctx.guild.id})" if ctx.guild else "DM",
+        inline=False,
+    )
+    embed.add_field(name="📍 ช่อง", value=ctx.channel.mention if ctx.guild else "DM", inline=False)
+
+    try:
+        await developer.send(embed=embed)
+        await ctx.send("✅ ส่งรายงานปัญหาไปหาผู้พัฒนาแล้วค่ะ ขอบคุณที่ช่วยแจ้งนะคะ 💗")
+    except discord.Forbidden:
+        await ctx.send("❌ ส่งรายงานไม่ได้ (ผู้พัฒนาอาจปิดรับ DM) รบกวนแจ้งช่องทางอื่นแทนนะคะ")
 
 
 @bot.event
@@ -646,11 +772,28 @@ async def on_guild_join(guild):
     try:
         await owner.send(
             content=f"👋 สวัสดีค่ะ! บอท **sunday.V2** เข้าร่วมเซิร์ฟเวอร์ **{guild.name}** ของคุณเรียบร้อยแล้ว "
-                    f"นี่คือคู่มือการใช้งานทั้งหมดค่ะ 💗",
+                    f"นี่คือคู่มือการใช้งานทั้งหมดค่ะ 💗\n\n"
+                    f"⚠️ **อย่าลืมตั้งค่าช่อง log ก่อนใช้งาน!** ไปที่ช่องที่ต้องการให้เป็น log แล้วพิมพ์ `!setlog` "
+                    f"ไม่งั้นระบบบันทึก log จะยังไม่ทำงานนะคะ",
             embed=embed,
         )
     except discord.Forbidden:
         print(f"⚠️ ส่ง DM หาเจ้าของเซิร์ฟเวอร์ '{guild.name}' ไม่ได้ (เขาอาจปิดรับ DM จากคนที่ไม่รู้จัก)")
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    """ดักจับ error ที่ไม่มี error handler เฉพาะของคำสั่งนั้นๆ กันไม่ให้เงียบหายไปเฉยๆ"""
+    if isinstance(error, commands.CommandNotFound):
+        return  # ไม่ต้องแจ้งถ้าพิมพ์คำสั่งที่ไม่มีอยู่จริง
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send("❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้")
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ ใส่ข้อมูลไม่ครบ ลองพิมพ์ `!ช่วยด้วย` เพื่อดูวิธีใช้คำสั่งนี้")
+        return
+    print(f"❌ [on_command_error] คำสั่ง '{ctx.command}' เกิดข้อผิดพลาด: {error}")
+    await ctx.send(f"❌ เกิดข้อผิดพลาดที่ไม่คาดคิด: `{error}`")
 
 
 if __name__ == "__main__":
