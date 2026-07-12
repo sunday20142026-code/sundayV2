@@ -23,7 +23,7 @@ LEGACY_LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))  # ใช้เป
 UNVERIFIED_ROLE_NAME = "Unverified"
 VERIFIED_ROLE_NAME = "Verified"
 BOT_ADMIN_ROLE_NAME = "Bot Admin"  # role ที่เจ้าของเซิร์ฟใช้แต่งตั้งให้คนอื่นใช้คำสั่ง moderation ได้
-DEVELOPER_CREDIT = os.getenv("DEVELOPER_CREDIT", "ACER")  # ชื่อ/แท็กผู้พัฒนาที่จะโชว์ในคู่มือ ตั้งค่าเองได้ผ่าน .env
+DEVELOPER_CREDIT = os.getenv("DEVELOPER_CREDIT", "GROUPSUNDAY @sunday41412")  # ชื่อ/แท็กผู้พัฒนาที่จะโชว์ในคู่มือ ตั้งค่าเองได้ผ่าน .env
 
 # ========== ระบบตั้งค่าแยกตามเซิร์ฟเวอร์ (multi-server support) ==========
 # แต่ละเซิร์ฟเวอร์ตั้งช่อง log ของตัวเองได้ผ่านคำสั่ง !setlog เก็บไว้ในไฟล์นี้
