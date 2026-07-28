@@ -171,6 +171,20 @@ def save_polls(data):
 
 NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
 
+# แคชยอดใช้งาน invite ของแต่ละเซิร์ฟเวอร์ไว้ในหน่วยความจำ (ไม่ต้องเซฟลงไฟล์ เพราะโหลดใหม่จาก Discord ได้ตอนสตาร์ท)
+# โครงสร้าง: { guild_id: { invite_code: uses_count } }
+invite_cache = {}
+
+
+async def refresh_invite_cache(guild):
+    """ดึงยอดใช้งาน invite ปัจจุบันทั้งหมดของเซิร์ฟเวอร์นี้มาเก็บไว้เทียบ"""
+    try:
+        invites = await guild.invites()
+        invite_cache[guild.id] = {inv.code: inv.uses for inv in invites}
+    except discord.Forbidden:
+        invite_cache[guild.id] = {}
+        print(f"⚠️ [Invite] บอทไม่มีสิทธิ์ Manage Server ในเซิร์ฟเวอร์ '{guild.name}' — ระบบติดตาม invite จะไม่ทำงาน")
+
 
 # ตั้งค่า Intents (สิทธิ์การเข้าถึงข้อมูลต่างๆ)
 intents = discord.Intents.default()
@@ -271,7 +285,7 @@ async def on_ready():
         bot.dev_owner_id = None
         print(f"⚠️ ดึงข้อมูลเจ้าของบอทไม่ได้: {e} — คำสั่ง !report จะใช้งานไม่ได้")
 
-    # เช็คสถานะช่อง log ของแต่ละเซิร์ฟเวอร์ทันทีตอนสตาร์ท
+    # เช็คสถานะช่อง log ของแต่ละเซิร์ฟเวอร์ทันทีตอนสตาร์ท + เตรียมแคช invite
     for guild in bot.guilds:
         log_channel_id = get_log_channel_id(guild.id) or LEGACY_LOG_CHANNEL_ID
         if not log_channel_id:
@@ -282,6 +296,8 @@ async def on_ready():
             print(f"✅ [{guild.name}] ช่อง log: #{channel.name}")
         else:
             print(f"❌ [{guild.name}] ตั้งช่อง log ไว้ (ID {log_channel_id}) แต่หาช่องนี้ไม่เจอ — ใช้ !setlog ตั้งใหม่")
+
+        await refresh_invite_cache(guild)
 
 
 @bot.event
@@ -319,6 +335,24 @@ async def on_member_join(member):
             f"กรุณาพิมพ์ `!verify` เพื่อยืนยันตัวตนก่อนใช้งานช่องอื่นๆ ครับ{note}"
         )
 
+    # เช็คว่าเข้ามาด้วย invite ลิงก์ไหน (เทียบยอดใช้งานก่อน-หลัง)
+    inviter_text = "ไม่ทราบ (อาจเป็น Vanity URL หรือบอทไม่มีสิทธิ์ Manage Server)"
+    try:
+        before_counts = invite_cache.get(guild.id, {})
+        after_invites = await guild.invites()
+        after_counts = {inv.code: inv.uses for inv in after_invites}
+        used_invite = None
+        for inv in after_invites:
+            if inv.uses is not None and inv.uses > before_counts.get(inv.code, 0):
+                used_invite = inv
+                break
+        if used_invite:
+            inviter_name = str(used_invite.inviter) if used_invite.inviter else "ไม่ทราบ"
+            inviter_text = f"{inviter_name} (โค้ด `{used_invite.code}`, ใช้ไปแล้ว {used_invite.uses} ครั้ง)"
+        invite_cache[guild.id] = after_counts
+    except discord.Forbidden:
+        pass
+
     # บันทึก log
     embed = discord.Embed(
         title="📥 สมาชิกใหม่เข้าเซิร์ฟเวอร์",
@@ -327,6 +361,7 @@ async def on_member_join(member):
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
     embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="🔗 เชิญโดย", value=inviter_text, inline=False)
     await send_log(guild, embed)
 
 
@@ -344,6 +379,39 @@ async def on_member_remove(member):
 
 
 @bot.event
+async def on_invite_create(invite):
+    """บันทึก log เมื่อมีการสร้างลิงก์เชิญใหม่ + อัปเดตแคชไว้ตรวจสอบภายหลัง"""
+    guild = invite.guild
+    invite_cache.setdefault(guild.id, {})[invite.code] = invite.uses or 0
+
+    embed = discord.Embed(
+        title="🔗 สร้างลิงก์เชิญใหม่",
+        color=discord.Color.blurple(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="โดยใคร", value=str(invite.inviter) if invite.inviter else "ไม่ทราบ", inline=True)
+    embed.add_field(name="โค้ด", value=f"`{invite.code}`", inline=True)
+    embed.add_field(name="ช่อง", value=invite.channel.mention if invite.channel else "ไม่ทราบ", inline=True)
+    embed.add_field(
+        name="อายุลิงก์",
+        value="ไม่หมดอายุ" if invite.max_age == 0 else f"{invite.max_age} วินาที",
+        inline=True,
+    )
+    embed.add_field(
+        name="จำนวนใช้ได้",
+        value="ไม่จำกัด" if invite.max_uses == 0 else str(invite.max_uses),
+        inline=True,
+    )
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_invite_delete(invite):
+    """เอา invite ที่ถูกลบออกจากแคช กันข้อมูลเก่าค้าง"""
+    invite_cache.get(invite.guild.id, {}).pop(invite.code, None)
+
+
+@bot.event
 async def on_message_delete(message):
     """บันทึก log เมื่อข้อความถูกลบ (ข้ามข้อความของบอทเอง)"""
     if message.author.bot:
@@ -355,8 +423,28 @@ async def on_message_delete(message):
     )
     embed.add_field(name="ผู้เขียน", value=f"{message.author.mention}", inline=True)
     embed.add_field(name="ช่อง", value=f"{message.channel.mention}", inline=True)
-    embed.add_field(name="เนื้อหา", value=message.content or "(ไม่มีข้อความ/เป็นรูปภาพ)", inline=False)
+    embed.add_field(name="เนื้อหา", value=(message.content or "(ไม่มีข้อความ/เป็นรูปภาพ)")[:1000], inline=False)
     await send_log(message.guild, embed)
+
+
+@bot.event
+async def on_message_edit(before, after):
+    """บันทึก log เมื่อข้อความถูกแก้ไข (ข้ามข้อความของบอทเอง และข้ามถ้าเนื้อหาไม่เปลี่ยน เช่น embed โหลดลิงก์)"""
+    if before.author.bot:
+        return
+    if before.content == after.content:
+        return
+    embed = discord.Embed(
+        title="✏️ ข้อความถูกแก้ไข",
+        color=discord.Color.blue(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="ผู้เขียน", value=f"{before.author.mention}", inline=True)
+    embed.add_field(name="ช่อง", value=f"{before.channel.mention}", inline=True)
+    embed.add_field(name="ก่อนแก้", value=(before.content or "(ว่าง)")[:1000], inline=False)
+    embed.add_field(name="หลังแก้", value=(after.content or "(ว่าง)")[:1000], inline=False)
+    if before.guild:
+        await send_log(before.guild, embed)
 
 
 @bot.event
@@ -396,6 +484,52 @@ async def on_voice_state_update(member, before, after):
         embed.add_field(name="สมาชิก", value=member.mention, inline=True)
         embed.add_field(name="จาก", value=before.channel.mention, inline=True)
         embed.add_field(name="ไปที่", value=after.channel.mention, inline=True)
+        await send_log(guild, embed)
+
+
+@bot.event
+async def on_member_update(before, after):
+    """บันทึก log เมื่อ: เปลี่ยนชื่อเล่น / role เปลี่ยนแปลง / เพิ่งบูสต์เซิร์ฟ"""
+    guild = after.guild
+
+    # เปลี่ยนชื่อเล่น
+    if before.nick != after.nick:
+        embed = discord.Embed(
+            title="✏️ เปลี่ยนชื่อเล่น",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.add_field(name="สมาชิก", value=after.mention, inline=True)
+        embed.add_field(name="ชื่อเดิม", value=before.nick or "(ไม่มี/ใช้ชื่อ username)", inline=True)
+        embed.add_field(name="ชื่อใหม่", value=after.nick or "(ไม่มี/ใช้ชื่อ username)", inline=True)
+        await send_log(guild, embed)
+
+    # Role เปลี่ยนแปลง
+    before_roles = set(before.roles)
+    after_roles = set(after.roles)
+    added_roles = after_roles - before_roles
+    removed_roles = before_roles - after_roles
+    if added_roles or removed_roles:
+        embed = discord.Embed(
+            title="🎭 Role ของสมาชิกเปลี่ยนแปลง",
+            color=discord.Color.teal(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.add_field(name="สมาชิก", value=after.mention, inline=False)
+        if added_roles:
+            embed.add_field(name="➕ เพิ่ม", value=", ".join(r.mention for r in added_roles), inline=True)
+        if removed_roles:
+            embed.add_field(name="➖ ถอด", value=", ".join(r.mention for r in removed_roles), inline=True)
+        await send_log(guild, embed)
+
+    # เพิ่งบูสต์เซิร์ฟ (premium_since เปลี่ยนจาก None -> มีค่า)
+    if before.premium_since is None and after.premium_since is not None:
+        embed = discord.Embed(
+            title="🚀 มีคน Boost เซิร์ฟเวอร์!",
+            description=f"{after.mention} เพิ่ง boost เซิร์ฟเวอร์นี้ ขอบคุณมากๆ ค่ะ 💗",
+            color=discord.Color.pink(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
         await send_log(guild, embed)
 
 
@@ -1254,7 +1388,11 @@ def build_help_embed(guild_name=None):
     )
     embed.add_field(
         name="⚙️ ตั้งค่าเซิร์ฟเวอร์ (ต้องมีสิทธิ์ Manage Server หรือ role Bot Admin)",
-        value="`!setlog` — ตั้งช่องที่พิมพ์คำสั่งนี้ให้เป็นช่อง log ของเซิร์ฟเวอร์นี้ (**ต้องตั้งก่อน ไม่งั้นระบบ log จะไม่ทำงาน**)",
+        value=(
+            "`!setlog` — ตั้งช่องที่พิมพ์คำสั่งนี้ให้เป็นช่อง log ของเซิร์ฟเวอร์นี้ (**ต้องตั้งก่อน ไม่งั้นระบบ log จะไม่ทำงาน**)\n"
+            "*Log ครอบคลุม: เข้า-ออกเซิร์ฟ (+เชิญโดยใคร), ข้อความถูกลบ/แก้ไข, VC, ส่งรูป, เปลี่ยนชื่อเล่น/Role/avatar, "
+            "สร้าง-ลบช่อง/Role, Pin ข้อความ, Boost เซิร์ฟ, สร้างลิงก์เชิญ, และคำสั่ง moderation ทั้งหมด*"
+        ),
         inline=False,
     )
     embed.add_field(
@@ -1310,6 +1448,149 @@ async def report(ctx, *, message: str = None):
         await ctx.send("✅ ส่งรายงานปัญหาไปหาผู้พัฒนาแล้วค่ะ ขอบคุณที่ช่วยแจ้งนะคะ 💗")
     except discord.Forbidden:
         await ctx.send("❌ ส่งรายงานไม่ได้ (ผู้พัฒนาอาจปิดรับ DM) รบกวนแจ้งช่องทางอื่นแทนนะคะ")
+
+
+# ========== ระบบ Log ขั้นสูง: ช่อง / Role / Pin / โปรไฟล์ ==========
+
+async def get_audit_log_actor(guild, action, target_id=None, within_seconds=10):
+    """พยายามหาว่าใครเป็นคนทำ action นี้ล่าสุดจาก Audit Log
+    คืนค่า None ถ้าหาไม่เจอ หรือบอทไม่มีสิทธิ์ View Audit Log"""
+    try:
+        async for entry in guild.audit_logs(action=action, limit=5):
+            age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
+            if age > within_seconds:
+                break
+            if target_id is not None and getattr(entry.target, "id", None) != target_id:
+                continue
+            return entry.user
+    except discord.Forbidden:
+        return None
+    return None
+
+
+@bot.event
+async def on_guild_channel_create(channel):
+    """บันทึก log เมื่อมีการสร้างช่องใหม่"""
+    guild = channel.guild
+    actor = await get_audit_log_actor(guild, discord.AuditLogAction.channel_create, target_id=channel.id)
+    embed = discord.Embed(
+        title="📁 สร้างช่องใหม่",
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="ช่อง", value=getattr(channel, "mention", f"#{channel.name}"), inline=True)
+    embed.add_field(name="ประเภท", value=str(channel.type), inline=True)
+    embed.add_field(name="โดยใคร", value=str(actor) if actor else "ไม่ทราบ", inline=True)
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    """บันทึก log เมื่อมีการลบช่อง"""
+    guild = channel.guild
+    actor = await get_audit_log_actor(guild, discord.AuditLogAction.channel_delete)
+    embed = discord.Embed(
+        title="🗑️ ลบช่อง",
+        color=discord.Color.red(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="ชื่อช่อง", value=f"#{channel.name}", inline=True)
+    embed.add_field(name="ประเภท", value=str(channel.type), inline=True)
+    embed.add_field(name="โดยใคร", value=str(actor) if actor else "ไม่ทราบ", inline=True)
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_guild_role_create(role):
+    """บันทึก log เมื่อมีการสร้าง role ใหม่ในเซิร์ฟเวอร์"""
+    actor = await get_audit_log_actor(role.guild, discord.AuditLogAction.role_create, target_id=role.id)
+    embed = discord.Embed(
+        title="🎭 สร้าง Role ใหม่",
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="Role", value=role.mention, inline=True)
+    embed.add_field(name="โดยใคร", value=str(actor) if actor else "ไม่ทราบ", inline=True)
+    await send_log(role.guild, embed)
+
+
+@bot.event
+async def on_guild_role_delete(role):
+    """บันทึก log เมื่อมีการลบ role ในเซิร์ฟเวอร์"""
+    actor = await get_audit_log_actor(role.guild, discord.AuditLogAction.role_delete)
+    embed = discord.Embed(
+        title="🗑️ ลบ Role",
+        color=discord.Color.red(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="ชื่อ Role", value=role.name, inline=True)
+    embed.add_field(name="โดยใคร", value=str(actor) if actor else "ไม่ทราบ", inline=True)
+    await send_log(role.guild, embed)
+
+
+@bot.event
+async def on_guild_channel_pins_update(channel, last_pin):
+    """บันทึก log เมื่อมีการ pin/unpin ข้อความ (ใช้ Audit Log หาว่าใครทำและข้อความไหน)"""
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        return
+
+    matched_entry = None
+    try:
+        async for entry in guild.audit_logs(limit=5):
+            if entry.action not in (discord.AuditLogAction.message_pin, discord.AuditLogAction.message_unpin):
+                continue
+            age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
+            if age > 10:
+                break
+            matched_entry = entry
+            break
+    except discord.Forbidden:
+        return
+
+    if matched_entry is None:
+        return  # หาไม่เจอจาก audit log ก็ข้ามไป กันข้อความ log ที่ไม่มีข้อมูลเป็นประโยชน์
+
+    is_pin = matched_entry.action == discord.AuditLogAction.message_pin
+    embed = discord.Embed(
+        title="📌 Pin ข้อความ" if is_pin else "📌 Unpin ข้อความ",
+        color=discord.Color.gold() if is_pin else discord.Color.light_grey(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="ช่อง", value=channel.mention, inline=True)
+    embed.add_field(name="โดยใคร", value=str(matched_entry.user) if matched_entry.user else "ไม่ทราบ", inline=True)
+    message_id = getattr(matched_entry.extra, "message_id", None)
+    if message_id:
+        embed.add_field(name="Message ID", value=str(message_id), inline=True)
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_user_update(before, after):
+    """บันทึก log เมื่อสมาชิกเปลี่ยน username หรือ avatar (แจ้งในทุกเซิร์ฟที่บอทเจอคนนี้อยู่ด้วย)"""
+    changes = []
+    if before.name != after.name:
+        changes.append(f"Username: `{before.name}` → `{after.name}`")
+    if before.avatar != after.avatar:
+        changes.append("เปลี่ยนรูปโปรไฟล์ (avatar)")
+
+    if not changes:
+        return
+
+    for guild in bot.guilds:
+        member = guild.get_member(after.id)
+        if member is None:
+            continue
+        embed = discord.Embed(
+            title="👤 เปลี่ยนข้อมูลโปรไฟล์",
+            description=f"{after.mention} ({after})",
+            color=discord.Color.blurple(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.add_field(name="การเปลี่ยนแปลง", value="\n".join(changes), inline=False)
+        if before.avatar != after.avatar:
+            embed.set_thumbnail(url=after.display_avatar.url)
+        await send_log(guild, embed)
 
 
 @bot.event
