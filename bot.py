@@ -126,6 +126,52 @@ def clear_warnings(guild_id, user_id):
     return count
 
 
+# ========== ระบบ Reaction Role (แยกไฟล์) ==========
+# โครงสร้าง: { "message_id": { "channel_id": int, "roles": { "emoji": role_id, ... } } }
+REACTION_ROLE_FILE = os.path.join(CONFIG_DIR, "reaction_roles.json")
+
+
+def load_reaction_roles():
+    if not os.path.exists(REACTION_ROLE_FILE):
+        return {}
+    try:
+        with open(REACTION_ROLE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_reaction_roles(data):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(REACTION_ROLE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ========== ระบบ Poll (แยกไฟล์) ==========
+# โครงสร้าง: { "message_id": { "channel_id": int, "question": str, "options": [str,...],
+#              "emojis": [str,...], "closed": bool } }
+POLL_FILE = os.path.join(CONFIG_DIR, "polls.json")
+
+
+def load_polls():
+    if not os.path.exists(POLL_FILE):
+        return {}
+    try:
+        with open(POLL_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_polls(data):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(POLL_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+
+
 # ตั้งค่า Intents (สิทธิ์การเข้าถึงข้อมูลต่างๆ)
 intents = discord.Intents.default()
 intents.message_content = True  # จำเป็นถ้าต้องการให้บอทอ่านเนื้อหาข้อความ
@@ -351,6 +397,85 @@ async def on_voice_state_update(member, before, after):
         embed.add_field(name="จาก", value=before.channel.mention, inline=True)
         embed.add_field(name="ไปที่", value=after.channel.mention, inline=True)
         await send_log(guild, embed)
+
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    """ระบบ Reaction Role: กดอิโมจิเพื่อรับ role (เลือกได้แค่ 1 อันต่อเมนู)"""
+    if payload.member is None or payload.member.bot:
+        return
+
+    data = load_reaction_roles()
+    conf = data.get(str(payload.message_id))
+    if not conf:
+        return
+
+    emoji_str = str(payload.emoji)
+    role_id = conf["roles"].get(emoji_str)
+    if not role_id:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    role = guild.get_role(role_id)
+    member = payload.member
+    if role is None:
+        return
+
+    try:
+        await member.add_roles(role, reason="Reaction Role")
+    except discord.Forbidden:
+        print(f"❌ [ReactionRole] บอทไม่มีสิทธิ์เพิ่ม role '{role.name}' ให้ {member}")
+        return
+
+    # เลือกได้แค่ 1 อันต่อเมนู: เอา reaction อื่นของคนนี้ในเมนูเดียวกันออก
+    # (การลบ reaction จะไปสั่ง on_raw_reaction_remove ให้ถอด role เก่าให้เองอัตโนมัติ)
+    channel = guild.get_channel(conf["channel_id"])
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(conf["channel_id"])
+        except (discord.NotFound, discord.Forbidden):
+            return
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except (discord.NotFound, discord.Forbidden):
+        return
+
+    for other_emoji in conf["roles"]:
+        if other_emoji == emoji_str:
+            continue
+        try:
+            await message.remove_reaction(other_emoji, member)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+
+
+@bot.event
+async def on_raw_reaction_remove(payload):
+    """ระบบ Reaction Role: เอาอิโมจิออก = ถอด role ออกด้วย"""
+    data = load_reaction_roles()
+    conf = data.get(str(payload.message_id))
+    if not conf:
+        return
+
+    emoji_str = str(payload.emoji)
+    role_id = conf["roles"].get(emoji_str)
+    if not role_id:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    role = guild.get_role(role_id)
+    member = guild.get_member(payload.user_id)
+    if role is None or member is None or member.bot:
+        return
+
+    try:
+        await member.remove_roles(role, reason="Reaction Role: เอาออก")
+    except discord.Forbidden:
+        print(f"❌ [ReactionRole] บอทไม่มีสิทธิ์ถอด role '{role.name}' จาก {member}")
 
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
@@ -776,6 +901,201 @@ async def userinfo_error(ctx, error):
         await ctx.send("❌ หาสมาชิกคนนี้ไม่เจอ")
 
 
+# ========== ระบบ Reaction Role ==========
+
+@bot.command(name="reactionrole")
+@mod_check("manage_roles")
+async def reactionrole(ctx, role: discord.Role, emoji: str, *, label: str):
+    """สร้างเมนู Reaction Role ใหม่ พิมพ์ !reactionrole @role อิโมจิ ข้อความอธิบาย"""
+    embed = discord.Embed(
+        title="🎭 เลือก Role ของคุณ",
+        description=f"{emoji} — {label}\n\nกดอิโมจิด้านล่างเพื่อรับ role (เลือกได้แค่ 1 อันในเมนูนี้)",
+        color=discord.Color.from_rgb(255, 179, 199),
+    )
+    message = await ctx.send(embed=embed)
+    try:
+        await message.add_reaction(emoji)
+    except discord.HTTPException:
+        await message.delete()
+        await ctx.send("❌ อิโมจินี้ใช้ไม่ได้ครับ (พิมพ์ผิด หรือเป็นอิโมจิ custom จากเซิร์ฟอื่นที่บอทเข้าไม่ถึง)")
+        return
+
+    data = load_reaction_roles()
+    data[str(message.id)] = {
+        "channel_id": ctx.channel.id,
+        "roles": {emoji: role.id},
+        "labels": {emoji: label},
+    }
+    save_reaction_roles(data)
+    await ctx.send(
+        f"✅ สร้าง Reaction Role แล้ว (Message ID: `{message.id}`)\n"
+        f"เพิ่ม role อื่นในเมนูเดียวกันได้ด้วย: `!reactionrole-add {message.id} @role อิโมจิ ข้อความ`"
+    )
+
+
+@reactionrole.error
+async def reactionrole_error(ctx, error):
+    if isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
+        await ctx.send("❌ คำสั่งนี้ต้องมีสิทธิ์ Manage Roles หรือ role Bot Admin")
+    elif isinstance(error, commands.RoleNotFound):
+        await ctx.send("❌ หา role นี้ไม่เจอ")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ ใช้แบบนี้: `!reactionrole @role อิโมจิ ข้อความอธิบาย`")
+
+
+@bot.command(name="reactionrole-add")
+@mod_check("manage_roles")
+async def reactionrole_add(ctx, message_id: int, role: discord.Role, emoji: str, *, label: str):
+    """เพิ่ม role เข้าไปในเมนู Reaction Role ที่มีอยู่แล้ว พิมพ์ !reactionrole-add <message_id> @role อิโมจิ ข้อความ"""
+    data = load_reaction_roles()
+    conf = data.get(str(message_id))
+    if not conf:
+        await ctx.send("❌ ไม่พบเมนู Reaction Role ที่ message_id นี้ (ต้องสร้างด้วย `!reactionrole` ก่อน)")
+        return
+
+    channel = ctx.guild.get_channel(conf["channel_id"])
+    if channel is None:
+        await ctx.send("❌ หาช่องของเมนูนี้ไม่เจอ")
+        return
+    try:
+        message = await channel.fetch_message(message_id)
+    except (discord.NotFound, discord.Forbidden):
+        await ctx.send("❌ หาข้อความนี้ไม่เจอ (อาจถูกลบไปแล้ว)")
+        return
+
+    try:
+        await message.add_reaction(emoji)
+    except discord.HTTPException:
+        await ctx.send("❌ อิโมจินี้ใช้ไม่ได้ครับ")
+        return
+
+    conf["roles"][emoji] = role.id
+    conf.setdefault("labels", {})[emoji] = label
+    save_reaction_roles(data)
+
+    lines = [f"{e} — {l}" for e, l in conf["labels"].items()]
+    embed = discord.Embed(
+        title="🎭 เลือก Role ของคุณ",
+        description="\n".join(lines) + "\n\nกดอิโมจิด้านล่างเพื่อรับ role (เลือกได้แค่ 1 อันในเมนูนี้)",
+        color=discord.Color.from_rgb(255, 179, 199),
+    )
+    await message.edit(embed=embed)
+    await ctx.send(f"✅ เพิ่ม {emoji} → {role.mention} เข้าไปในเมนูแล้ว")
+
+
+@reactionrole_add.error
+async def reactionrole_add_error(ctx, error):
+    if isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
+        await ctx.send("❌ คำสั่งนี้ต้องมีสิทธิ์ Manage Roles หรือ role Bot Admin")
+    elif isinstance(error, commands.RoleNotFound):
+        await ctx.send("❌ หา role นี้ไม่เจอ")
+    elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+        await ctx.send("❌ ใช้แบบนี้: `!reactionrole-add <message_id> @role อิโมจิ ข้อความ`")
+
+
+# ========== ระบบ Poll ==========
+
+@bot.command(name="poll")
+@mod_check("manage_messages")
+async def poll(ctx, question: str, *options: str):
+    """สร้างโพล พิมพ์ !poll "คำถาม" ตัวเลือก1 ตัวเลือก2 ... (2-9 ตัวเลือก แต่ละตัวเลือกห้ามมีช่องว่าง)"""
+    if len(options) < 2:
+        await ctx.send('❌ ต้องมีอย่างน้อย 2 ตัวเลือก เช่น `!poll "กินอะไรดี" ข้าว ก๋วยเตี๋ยว`')
+        return
+    if len(options) > 9:
+        await ctx.send("❌ ใส่ตัวเลือกได้สูงสุด 9 อัน")
+        return
+
+    emojis = NUMBER_EMOJIS[:len(options)]
+    description = "\n".join(f"{emojis[i]} {opt}" for i, opt in enumerate(options))
+    embed = discord.Embed(
+        title=f"📊 {question}",
+        description=description,
+        color=discord.Color.from_rgb(255, 179, 199),
+    )
+    embed.set_footer(text=f"เปิดโดย {ctx.author} • ดูคะแนนสดได้จากอิโมจิ • แอดมินปิดโพลด้วย !endpoll")
+    message = await ctx.send(embed=embed)
+    for e in emojis:
+        await message.add_reaction(e)
+
+    data = load_polls()
+    data[str(message.id)] = {
+        "channel_id": ctx.channel.id,
+        "question": question,
+        "options": list(options),
+        "emojis": emojis,
+        "closed": False,
+    }
+    save_polls(data)
+
+
+@poll.error
+async def poll_error(ctx, error):
+    if isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
+        await ctx.send("❌ คำสั่งนี้ต้องมีสิทธิ์ Manage Messages หรือ role Bot Admin")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send('❌ ใช้แบบนี้: `!poll "คำถาม" ตัวเลือก1 ตัวเลือก2 ...`')
+
+
+@bot.command(name="endpoll")
+@mod_check("manage_messages")
+async def endpoll(ctx, message_id: int):
+    """ปิดโพลและประกาศผล พิมพ์ !endpoll <message_id>"""
+    data = load_polls()
+    conf = data.get(str(message_id))
+    if not conf:
+        await ctx.send("❌ ไม่พบโพลที่ message_id นี้")
+        return
+    if conf["closed"]:
+        await ctx.send("⚠️ โพลนี้ปิดไปแล้ว")
+        return
+
+    channel = ctx.guild.get_channel(conf["channel_id"])
+    if channel is None:
+        await ctx.send("❌ หาช่องของโพลนี้ไม่เจอ")
+        return
+    try:
+        message = await channel.fetch_message(message_id)
+    except (discord.NotFound, discord.Forbidden):
+        await ctx.send("❌ หาข้อความโพลนี้ไม่เจอ (อาจถูกลบไปแล้ว)")
+        return
+
+    results = []
+    for emoji, option in zip(conf["emojis"], conf["options"]):
+        reaction = discord.utils.get(message.reactions, emoji=emoji)
+        count = (reaction.count - 1) if reaction else 0  # หัก 1 เพราะบอทกดเองตอนสร้างโพล
+        results.append((option, count))
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    top_score = results[0][1]
+    lines = []
+    for opt, count in results:
+        marker = "🏆" if count == top_score and top_score > 0 else "▫️"
+        lines.append(f"{marker} **{opt}** — {count} โหวต")
+
+    result_embed = discord.Embed(
+        title=f"📊 ผลโพล: {conf['question']} (ปิดแล้ว)",
+        description="\n".join(lines),
+        color=discord.Color.dark_grey(),
+    )
+    await ctx.send(embed=result_embed)
+
+    conf["closed"] = True
+    save_polls(data)
+    try:
+        await message.clear_reactions()
+    except discord.Forbidden:
+        pass
+
+
+@endpoll.error
+async def endpoll_error(ctx, error):
+    if isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
+        await ctx.send("❌ คำสั่งนี้ต้องมีสิทธิ์ Manage Messages หรือ role Bot Admin")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("❌ message_id ต้องเป็นตัวเลข ลองก็อปจากการคลิกขวาที่ข้อความ > Copy Message ID")
+
+
 # ========== ระบบจัดการสิทธิ์แอดมิน ==========
 
 @bot.command(name="setlog")
@@ -905,6 +1225,23 @@ def build_help_embed(guild_name=None):
     embed.add_field(
         name="🔍 ดูข้อมูลสมาชิก (ใครก็ใช้ได้)",
         value="`!userinfo [@คน]` — ดูโปรไฟล์ + role + สถานะ mute + ประวัติ warn (ไม่ใส่ @คน = ดูตัวเอง)",
+        inline=False,
+    )
+    embed.add_field(
+        name="🎭 Reaction Role (ต้องมีสิทธิ์ Manage Roles หรือ role Bot Admin)",
+        value=(
+            "`!reactionrole @role อิโมจิ ข้อความ` — สร้างเมนู Reaction Role ใหม่\n"
+            "`!reactionrole-add <message_id> @role อิโมจิ ข้อความ` — เพิ่ม role เข้าเมนูเดิม\n"
+            "*(สมาชิกเลือก role ได้แค่ 1 อันต่อเมนู)*"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📊 Poll (ต้องมีสิทธิ์ Manage Messages หรือ role Bot Admin)",
+        value=(
+            '`!poll "คำถาม" ตัวเลือก1 ตัวเลือก2 ...` — สร้างโพล (สูงสุด 9 ตัวเลือก)\n'
+            "`!endpoll <message_id>` — ปิดโพลและประกาศผล"
+        ),
         inline=False,
     )
     embed.add_field(
