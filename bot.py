@@ -23,7 +23,7 @@ LEGACY_LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))  # ใช้เป
 UNVERIFIED_ROLE_NAME = "Unverified"
 VERIFIED_ROLE_NAME = "Verified"
 BOT_ADMIN_ROLE_NAME = "Bot Admin"  # role ที่เจ้าของเซิร์ฟใช้แต่งตั้งให้คนอื่นใช้คำสั่ง moderation ได้
-DEVELOPER_CREDIT = os.getenv("DEVELOPER_CREDIT", "GROUPSUNDAY @sunday41412")  # ชื่อ/แท็กผู้พัฒนาที่จะโชว์ในคู่มือ ตั้งค่าเองได้ผ่าน .env
+DEVELOPER_CREDIT = os.getenv("DEVELOPER_CREDIT", "ACER")  # ชื่อ/แท็กผู้พัฒนาที่จะโชว์ในคู่มือ ตั้งค่าเองได้ผ่าน .env
 
 # ========== ระบบตั้งค่าแยกตามเซิร์ฟเวอร์ (multi-server support) ==========
 # แต่ละเซิร์ฟเวอร์ตั้งช่อง log ของตัวเองได้ผ่านคำสั่ง !setlog เก็บไว้ในไฟล์นี้
@@ -66,6 +66,64 @@ def set_log_channel_id(guild_id, channel_id):
     guild_conf = data.setdefault(str(guild_id), {})
     guild_conf["log_channel_id"] = channel_id
     save_all_config(data)
+
+
+# ========== ระบบเก็บสถิติ Warn (แยกไฟล์จาก guild_config.json) ==========
+# โครงสร้าง: { "guild_id": { "user_id": [ {reason, moderator_id, moderator_name, timestamp}, ... ] } }
+WARN_FILE = os.path.join(CONFIG_DIR, "warnings.json")
+
+WARN_MUTE_THRESHOLD = 3   # ครบ 3 ครั้ง -> auto-mute
+WARN_MUTE_MINUTES = 30    # ระยะเวลา auto-mute (นาที)
+WARN_KICK_THRESHOLD = 5   # ครบ 5 ครั้ง -> auto-kick
+
+
+def load_all_warnings():
+    """โหลดข้อมูล warn ทั้งหมดของทุกเซิร์ฟเวอร์จากไฟล์ JSON"""
+    if not os.path.exists(WARN_FILE):
+        return {}
+    try:
+        with open(WARN_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_all_warnings(data):
+    """เซฟข้อมูล warn ทั้งหมดกลับลงไฟล์ JSON"""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(WARN_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def add_warning(guild_id, user_id, reason, moderator):
+    """เพิ่ม warn ให้สมาชิกคนนี้ แล้วคืนค่าจำนวน warn ทั้งหมดที่มีตอนนี้"""
+    data = load_all_warnings()
+    guild_warns = data.setdefault(str(guild_id), {})
+    user_warns = guild_warns.setdefault(str(user_id), [])
+    user_warns.append({
+        "reason": reason,
+        "moderator_id": moderator.id,
+        "moderator_name": str(moderator),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    })
+    save_all_warnings(data)
+    return len(user_warns)
+
+
+def get_warnings(guild_id, user_id):
+    """คืนค่า list ของ warn ทั้งหมดของสมาชิกคนนี้ (list ว่างถ้าไม่มี)"""
+    data = load_all_warnings()
+    return data.get(str(guild_id), {}).get(str(user_id), [])
+
+
+def clear_warnings(guild_id, user_id):
+    """ล้าง warn ทั้งหมดของสมาชิกคนนี้ คืนค่าจำนวนที่ถูกล้างไป"""
+    data = load_all_warnings()
+    guild_warns = data.setdefault(str(guild_id), {})
+    count = len(guild_warns.get(str(user_id), []))
+    guild_warns[str(user_id)] = []
+    save_all_warnings(data)
+    return count
 
 
 # ตั้งค่า Intents (สิทธิ์การเข้าถึงข้อมูลต่างๆ)
@@ -514,6 +572,15 @@ async def unmute(ctx, member: discord.Member):
     await member.timeout(None)
     await ctx.send(f"🔊 ยกเลิกปิดเสียง {member.mention} แล้ว")
 
+    embed = discord.Embed(
+        title="🔊 Unmute",
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="สมาชิก", value=f"{member} ({member.id})", inline=False)
+    embed.add_field(name="โดยใคร", value=ctx.author.mention, inline=True)
+    await send_log(ctx.guild, embed)
+
 
 @unmute.error
 async def unmute_error(ctx, error):
@@ -542,21 +609,171 @@ async def clear_error(ctx, error):
 @bot.command(name="warn")
 @mod_check("kick_members")
 async def warn(ctx, member: discord.Member, *, reason: str = "ไม่ระบุเหตุผล"):
-    """เตือนสมาชิก พิมพ์ !warn @ชื่อ เหตุผล"""
+    """เตือนสมาชิก พิมพ์ !warn @ชื่อ เหตุผล (ครบ 3 ครั้ง auto-mute, ครบ 5 ครั้ง auto-kick)"""
+    warn_count = add_warning(ctx.guild.id, member.id, reason, ctx.author)
+
     dm_sent = await send_dm_template(
         member,
         title="⚠️ คุณถูกเตือน",
-        description=f"คุณถูกเตือนในเซิร์ฟเวอร์ **{ctx.guild.name}**",
+        description=f"คุณถูกเตือนในเซิร์ฟเวอร์ **{ctx.guild.name}** (ครั้งที่ {warn_count})",
         extra_fields=[("🍓 เหตุผล", reason)],
     )
     dm_status = "(ส่ง DM แจ้งแล้ว)" if dm_sent else "(ส่ง DM ไม่ได้ อาจปิดรับข้อความส่วนตัว)"
-    await ctx.send(f"⚠️ เตือน {member.mention} แล้ว {dm_status}\nเหตุผล: {reason}")
+    await ctx.send(f"⚠️ เตือน {member.mention} แล้ว (ครั้งที่ {warn_count}) {dm_status}\nเหตุผล: {reason}")
+
+    embed = discord.Embed(
+        title="⚠️ Warn",
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="สมาชิก", value=f"{member} ({member.id})", inline=False)
+    embed.add_field(name="โดยใคร", value=ctx.author.mention, inline=True)
+    embed.add_field(name="เหตุผล", value=reason, inline=True)
+    embed.add_field(name="จำนวน warn สะสม", value=str(warn_count), inline=True)
+    await send_log(ctx.guild, embed)
+
+    # ตรวจว่าครบเกณฑ์ auto-action หรือยัง (kick เช็คก่อน เพราะเป็นเกณฑ์สูงกว่า)
+    if warn_count >= WARN_KICK_THRESHOLD:
+        auto_reason = f"ครบ {WARN_KICK_THRESHOLD} warn (auto-kick)"
+        await send_dm_template(
+            member,
+            title="👢 คุณถูกเตะออกจากเซิร์ฟเวอร์ (Auto)",
+            description=f"คุณสะสม warn ครบ {WARN_KICK_THRESHOLD} ครั้งในเซิร์ฟเวอร์ **{ctx.guild.name}**",
+        )
+        try:
+            await member.kick(reason=auto_reason)
+            await ctx.send(f"👢 {member.mention} ถูกเตะออกอัตโนมัติ เนื่องจากสะสม warn ครบ {WARN_KICK_THRESHOLD} ครั้ง")
+            auto_embed = discord.Embed(
+                title="👢 Auto-Kick (ครบเกณฑ์ Warn)",
+                description=f"{member.mention} ({member}) ถูกเตะออกอัตโนมัติ",
+                color=discord.Color.red(),
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
+            )
+            auto_embed.add_field(name="จำนวน warn สะสม", value=str(warn_count), inline=True)
+            await send_log(ctx.guild, auto_embed)
+        except discord.Forbidden:
+            await ctx.send("⚠️ ครบเกณฑ์ auto-kick แล้ว แต่บอทไม่มีสิทธิ์เตะสมาชิกคนนี้")
+    elif warn_count >= WARN_MUTE_THRESHOLD:
+        auto_reason = f"ครบ {WARN_MUTE_THRESHOLD} warn (auto-mute {WARN_MUTE_MINUTES} นาที)"
+        try:
+            await member.timeout(datetime.timedelta(minutes=WARN_MUTE_MINUTES), reason=auto_reason)
+            await send_dm_template(
+                member,
+                title="🔇 คุณถูกปิดเสียงอัตโนมัติ (Auto)",
+                description=(
+                    f"คุณสะสม warn ครบ {WARN_MUTE_THRESHOLD} ครั้งในเซิร์ฟเวอร์ **{ctx.guild.name}** "
+                    f"จึงถูกปิดเสียงอัตโนมัติเป็นเวลา {WARN_MUTE_MINUTES} นาที"
+                ),
+            )
+            await ctx.send(f"🔇 {member.mention} ถูกปิดเสียงอัตโนมัติ {WARN_MUTE_MINUTES} นาที เนื่องจากสะสม warn ครบ {WARN_MUTE_THRESHOLD} ครั้ง")
+            auto_embed = discord.Embed(
+                title="🔇 Auto-Mute (ครบเกณฑ์ Warn)",
+                description=f"{member.mention} ({member}) ถูกปิดเสียงอัตโนมัติ {WARN_MUTE_MINUTES} นาที",
+                color=discord.Color.gold(),
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
+            )
+            auto_embed.add_field(name="จำนวน warn สะสม", value=str(warn_count), inline=True)
+            await send_log(ctx.guild, auto_embed)
+        except discord.Forbidden:
+            await ctx.send("⚠️ ครบเกณฑ์ auto-mute แล้ว แต่บอทไม่มีสิทธิ์ปิดเสียงสมาชิกคนนี้")
 
 
 @warn.error
 async def warn_error(ctx, error):
-    if isinstance(error, commands.CheckFailure):
+    if isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
         await ctx.send("❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้ (ต้องมีสิทธิ์ Kick Members หรือ role Bot Admin)")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ หาสมาชิกคนนี้ไม่เจอ")
+
+
+@bot.command(name="clearwarnings")
+@mod_check("administrator")
+async def clearwarnings(ctx, member: discord.Member):
+    """ล้างประวัติ warn ทั้งหมดของสมาชิกคนนี้ (เฉพาะเจ้าของเซิร์ฟเวอร์/Bot Admin) พิมพ์ !clearwarnings @ชื่อ"""
+    count = clear_warnings(ctx.guild.id, member.id)
+    if count == 0:
+        await ctx.send(f"{member.mention} ไม่มีประวัติ warn อยู่แล้วครับ")
+        return
+
+    await ctx.send(f"✅ ล้างประวัติ warn ของ {member.mention} แล้ว (ลบไป {count} รายการ)")
+
+    embed = discord.Embed(
+        title="🧹 ล้างประวัติ Warn",
+        description=f"{member.mention} ({member}) ถูกล้างประวัติ warn ({count} รายการ)",
+        color=discord.Color.teal(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="โดยใคร", value=ctx.author.mention, inline=True)
+    await send_log(ctx.guild, embed)
+
+
+@clearwarnings.error
+async def clearwarnings_error(ctx, error):
+    if isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
+        await ctx.send("❌ คำสั่งนี้ใช้ได้เฉพาะเจ้าของเซิร์ฟเวอร์หรือ Bot Admin เท่านั้น")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ หาสมาชิกคนนี้ไม่เจอ")
+
+
+@bot.command(name="userinfo")
+async def userinfo(ctx, member: discord.Member = None):
+    """ดูข้อมูลสมาชิกแบบครบ (โปรไฟล์ + role + สถานะ mute + ประวัติ warn) พิมพ์ !userinfo @ชื่อ (ไม่ใส่ = ดูตัวเอง)"""
+    member = member or ctx.author
+    guild = ctx.guild
+
+    warns = get_warnings(guild.id, member.id)
+
+    embed = discord.Embed(
+        title=f"👤 ข้อมูลสมาชิก: {member}",
+        color=discord.Color.from_rgb(255, 179, 199),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="🆔 User ID", value=str(member.id), inline=True)
+    embed.add_field(name="📅 สร้างบัญชีเมื่อ", value=member.created_at.strftime("%d/%m/%Y"), inline=True)
+    embed.add_field(
+        name="📥 เข้าเซิร์ฟเวอร์นี้เมื่อ",
+        value=member.joined_at.strftime("%d/%m/%Y") if member.joined_at else "ไม่ทราบ",
+        inline=True,
+    )
+
+    roles = [r.mention for r in member.roles if r.name != "@everyone"]
+    embed.add_field(
+        name=f"🎭 Role ({len(roles)})",
+        value=", ".join(roles) if roles else "ไม่มี",
+        inline=False,
+    )
+
+    if member.is_timed_out():
+        until = member.timed_out_until.strftime("%d/%m/%Y %H:%M UTC") if member.timed_out_until else "ไม่ทราบ"
+        embed.add_field(name="🔇 สถานะ", value=f"ถูกปิดเสียงอยู่ (ถึง {until})", inline=False)
+    else:
+        embed.add_field(name="🔊 สถานะ", value="ปกติ", inline=False)
+
+    if warns:
+        recent = warns[-3:][::-1]  # 3 รายการล่าสุด ใหม่สุดก่อน
+        warn_lines = []
+        for w in recent:
+            date_str = w["timestamp"][:10]
+            warn_lines.append(f"• `{date_str}` โดย {w['moderator_name']}: {w['reason']}")
+        warn_value = "\n".join(warn_lines)
+        if len(warns) > 3:
+            warn_value += f"\n*(และอีก {len(warns) - 3} รายการก่อนหน้า)*"
+        embed.add_field(
+            name=f"⚠️ ประวัติ Warn (รวม {len(warns)} ครั้ง)",
+            value=warn_value,
+            inline=False,
+        )
+    else:
+        embed.add_field(name="⚠️ ประวัติ Warn", value="ไม่มีประวัติ warn", inline=False)
+
+    await ctx.send(embed=embed)
+
+
+@userinfo.error
+async def userinfo_error(ctx, error):
+    if isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ หาสมาชิกคนนี้ไม่เจอ")
 
 
 # ========== ระบบจัดการสิทธิ์แอดมิน ==========
@@ -679,9 +896,15 @@ def build_help_embed(guild_name=None):
             "`!unban <ชื่อ/ID>` — ปลดแบน\n"
             "`!mute @คน [นาที] [เหตุผล]` — ปิดเสียงชั่วคราว\n"
             "`!unmute @คน` — ยกเลิกปิดเสียง\n"
-            "`!warn @คน [เหตุผล]` — เตือน\n"
+            "`!warn @คน [เหตุผล]` — เตือน (ครบ 3 auto-mute, ครบ 5 auto-kick)\n"
+            "`!clearwarnings @คน` — ล้างประวัติ warn (เฉพาะเจ้าของ/Bot Admin)\n"
             "`!clear <จำนวน>` — ลบข้อความ"
         ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔍 ดูข้อมูลสมาชิก (ใครก็ใช้ได้)",
+        value="`!userinfo [@คน]` — ดูโปรไฟล์ + role + สถานะ mute + ประวัติ warn (ไม่ใส่ @คน = ดูตัวเอง)",
         inline=False,
     )
     embed.add_field(
